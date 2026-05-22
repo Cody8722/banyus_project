@@ -1,5 +1,5 @@
 // Robotic arm controller — ESP32 + PCA9685 + Pixy2 + HTTP backend
-// 保留原本功能，優化：梯形速度連續性、HTTP 重試、記憶體、常數抽出。
+// 非阻塞 FSM + S-curve + 多幀中位數 + 完整 PID + PCA9685 批次寫入 + 串流 JSON
 
 #include <WiFi.h>
 #include <HTTPClient.h>
@@ -27,24 +27,24 @@ namespace cfg {
 
   // Servo
   constexpr uint16_t PWM_FREQ   = 50;
-  constexpr uint16_t PWM_MIN    = 150;   // 對應 0°
-  constexpr uint16_t PWM_MAX    = 600;   // 對應 180°
+  constexpr uint16_t PWM_MIN    = 150;   // 0°
+  constexpr uint16_t PWM_MAX    = 600;   // 180°
   constexpr uint8_t  SERVO_LO   = 5;
   constexpr uint8_t  SERVO_HI   = 175;
   constexpr uint8_t  GRIPPER_HI = 90;
 
-  // Home position
+  // Home
   constexpr uint8_t  HOME_CH0   = 90;
   constexpr uint8_t  HOME_CH1   = 90;
   constexpr uint8_t  HOME_CH2   = 120;
   constexpr uint8_t  HOME_CH3   = 5;
 
   // Motion
-  constexpr uint16_t MOVE_STEPS   = 40;
-  constexpr uint16_t MOVE_MS      = 1200;
-  constexpr uint16_t MOVE_FAST_MS = 400;
-  constexpr uint16_t MOVE_INIT_MS = 2000;
-  constexpr float    ACCEL_FRAC   = 0.25f;   // 加減速段佔比
+  constexpr uint16_t MOVE_STEPS      = 40;
+  constexpr uint16_t MOVE_MS         = 1200;
+  constexpr uint16_t MOVE_FAST_MS    = 400;
+  constexpr uint16_t MOVE_INIT_MS    = 2000;
+  constexpr uint16_t PHASE_SETTLE_MS = 300;
 
   // Vision
   constexpr uint16_t VISION_INTERVAL_MS = 3000;
@@ -52,95 +52,151 @@ namespace cfg {
   constexpr uint8_t  PIXY_SIG_DEST      = 2;
   constexpr uint8_t  PIXY_MAX_BLOCKS    = 4;
   constexpr uint8_t  PIXY_READ_DELAY_MS = 5;
+  constexpr uint8_t  MEDIAN_SAMPLES     = 3;
+  constexpr uint8_t  MEDIAN_GAP_MS      = 20;
 
-  // P 控制器
-  constexpr float    KP            = 0.43f;   // 原 0.4 × 1.075（已合併單位換算）
+  // PID
+  constexpr float    KP            = 0.43f;
+  constexpr float    KI            = 0.05f;
+  constexpr float    KD            = 0.10f;
+  constexpr float    I_MAX         = 30.0f;
   constexpr uint8_t  PID_MAX_ITER  = 3;
-  constexpr uint8_t  PID_TOLERANCE = 5;        // 像素
+  constexpr uint8_t  PID_TOLERANCE = 5;     // 像素
   constexpr uint16_t PID_SETTLE_MS = 300;
 
-  // Watchdog
+  // Watchdog / JSON
   constexpr uint32_t WDT_TIMEOUT_MS = 30000;
+  constexpr size_t   JSON_BUF_SIZE  = 2048;
 
-  // JSON
-  constexpr size_t   JSON_BUF_SIZE = 2048;
+  // PCA9685 register
+  constexpr uint8_t  PCA_LED0_ON_L  = 0x06;
 }
 
 // ── 型別 ──────────────────────────────────────────
 struct Block {
   int signature = 0;
-  int x = -1;
-  int y = -1;
-  int width = 0;
-  int height = 0;
+  int x = -1, y = -1, width = 0, height = 0;
   bool valid() const { return x >= 0; }
 };
 
-// ── 全域物件 / 狀態 ───────────────────────────────
+struct Motion {
+  bool active = false;
+  int  start_a[4]{};
+  int  target_a[4]{};
+  int  total_ms = 0;
+  unsigned long t0 = 0;
+  int  last_step = -1;
+};
+
+struct PhaseAngles {
+  int  ch[4];
+  bool present = false;
+};
+
+enum class Stage : uint8_t { IDLE, EXECUTE };
+enum class Sub   : uint8_t { PHASE_MOVE, PHASE_SETTLE, PID_SETTLE, PID_MOVE };
+
+struct SysState {
+  Stage stage = Stage::IDLE;
+  Sub   sub   = Sub::PHASE_MOVE;
+  int   phase_idx = 0;
+  int   target_u  = -1;
+  unsigned long stage_t    = 0;
+  unsigned long lastVision = 0;
+
+  // PID
+  uint8_t pid_iter     = 0;
+  float   pid_i        = 0.0f;
+  int     pid_prev_err = 0;
+};
+
+// ── 全域 ──────────────────────────────────────────
 static Adafruit_PWMServoDriver pwm(cfg::PWM_ADDR);
-static int           cur[4]     = {cfg::HOME_CH0, cfg::HOME_CH1, cfg::HOME_CH2, cfg::HOME_CH3};
-static bool          busy       = false;
-static unsigned long lastVision = 0;
+static int          cur[4] = {cfg::HOME_CH0, cfg::HOME_CH1, cfg::HOME_CH2, cfg::HOME_CH3};
+static Motion       motion;
+static const char* const PHASE_NAMES[] = {"pick", "grip", "place", "release", "home"};
+static constexpr uint8_t NUM_PHASES    = 5;
+static PhaseAngles  phases[NUM_PHASES];
+static SysState     S;
 
 // ── 工具 ──────────────────────────────────────────
 static inline int  angleToPWM(int a) { return map(a, 0, 180, cfg::PWM_MIN, cfg::PWM_MAX); }
 static inline void feedWDT()         { esp_task_wdt_reset(); }
 
-// ── 平滑梯形速度曲線 ─────────────────────────────
-// 三段：加速 / 等速 / 減速。位置曲線在段邊界一階可微，避免速度跳變。
-// v 為等速段速度，選擇 v = 1/(1−ta) 使總距離正好 1。
-static float trapezoidalRatio(float t) {
-  const float ta = cfg::ACCEL_FRAC;
-  const float v  = 1.0f / (1.0f - ta);
-  if (t < ta) {
-    return 0.5f * v * t * t / ta;                      // 0 → v·ta/2
-  }
-  if (t > 1.0f - ta) {
-    const float dt = 1.0f - t;
-    return 1.0f - 0.5f * v * dt * dt / ta;             // (1 − v·ta/2) → 1
-  }
-  return 0.5f * v * ta + v * (t - ta);                 // 等速
+// 5 階 smoothstep（S 曲線）：起終點 v 與 a 皆為 0，jerk-limited
+static inline float sCurveRatio(float t) {
+  return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
 }
 
-static void moveTrap(int ch0, int ch1, int ch2, int ch3, int total_ms = cfg::MOVE_MS) {
-  const int target[4] = {ch0, ch1, ch2, ch3};
-  const int steps     = cfg::MOVE_STEPS;
-  const int dt_ms     = max(1, total_ms / steps);
-
-  for (int s = 1; s <= steps; s++) {
-    const float r = trapezoidalRatio((float)s / steps);
-    for (int ch = 0; ch < 4; ch++) {
-      const int angle = cur[ch] + (int)((target[ch] - cur[ch]) * r);
-      pwm.setPWM(ch, 0, angleToPWM(constrain(angle, 0, cfg::SERVO_HI)));
-    }
-    feedWDT();
-    delay(dt_ms);
+// 一次 I2C 寫完 4 軸 PWM（PCA9685 auto-increment）
+static void writePWM4(const int angles[4]) {
+  Wire.beginTransmission(cfg::PWM_ADDR);
+  Wire.write(cfg::PCA_LED0_ON_L);
+  for (int ch = 0; ch < 4; ch++) {
+    const int a = constrain(angles[ch], 0, cfg::SERVO_HI);
+    const uint16_t v = angleToPWM(a);
+    Wire.write(0);                 // ON_L
+    Wire.write(0);                 // ON_H
+    Wire.write(v & 0xFF);          // OFF_L
+    Wire.write((v >> 8) & 0xFF);   // OFF_H
   }
-  memcpy(cur, target, sizeof(cur));
+  Wire.endTransmission();
 }
 
-// ── Pixy2 I2C 讀取（保留原協定） ──────────────────
+// ── 動作 FSM ──────────────────────────────────────
+static void startMotion(int ch0, int ch1, int ch2, int ch3,
+                        int total_ms = cfg::MOVE_MS) {
+  motion.target_a[0] = ch0;
+  motion.target_a[1] = ch1;
+  motion.target_a[2] = ch2;
+  motion.target_a[3] = ch3;
+  memcpy(motion.start_a, cur, sizeof(cur));
+  motion.total_ms  = max(50, total_ms);
+  motion.t0        = millis();
+  motion.last_step = -1;
+  motion.active    = true;
+}
+
+static void tickMotion() {
+  if (!motion.active) return;
+  const unsigned long elapsed = millis() - motion.t0;
+
+  if (elapsed >= (unsigned long)motion.total_ms) {
+    memcpy(cur, motion.target_a, sizeof(cur));
+    writePWM4(cur);
+    motion.active = false;
+    return;
+  }
+
+  const int step = (int)((elapsed * cfg::MOVE_STEPS) / motion.total_ms);
+  if (step == motion.last_step) return;
+  motion.last_step = step;
+
+  const float r = sCurveRatio((float)step / cfg::MOVE_STEPS);
+  int a[4];
+  for (int ch = 0; ch < 4; ch++) {
+    a[ch] = motion.start_a[ch] + (int)((motion.target_a[ch] - motion.start_a[ch]) * r);
+  }
+  writePWM4(a);
+}
+
+// ── Pixy2 I2C 讀取 ────────────────────────────────
 static Block getBlockBySig(int sig) {
   Block b;
   Wire1.beginTransmission(cfg::PIXY_ADDR);
-  Wire1.write(0x20);
-  Wire1.write(0x00);
-  Wire1.write(cfg::PIXY_MAX_BLOCKS);
+  Wire1.write(0x20); Wire1.write(0x00); Wire1.write(cfg::PIXY_MAX_BLOCKS);
   Wire1.endTransmission();
   delay(cfg::PIXY_READ_DELAY_MS);
 
   int count = 0;
   Wire1.requestFrom(cfg::PIXY_ADDR, (uint8_t)2);
-  if (Wire1.available() >= 2) {
-    Wire1.read();           // skip
-    count = Wire1.read();
-  }
+  if (Wire1.available() >= 2) { Wire1.read(); count = Wire1.read(); }
   if (count <= 0) return b;
 
   for (int i = 0; i < count; i++) {
     if (Wire1.requestFrom(cfg::PIXY_ADDR, (uint8_t)14) < 14) continue;
     if (Wire1.available() < 14) continue;
-    for (int k = 0; k < 4; k++) Wire1.read();          // skip header
+    for (int k = 0; k < 4; k++) Wire1.read();
     const int s = Wire1.read() | (Wire1.read() << 8);
     const int x = Wire1.read() | (Wire1.read() << 8);
     const int y = Wire1.read() | (Wire1.read() << 8);
@@ -151,72 +207,61 @@ static Block getBlockBySig(int sig) {
   return b;
 }
 
-// ── 視覺 P 控制（只修正 ch0） ─────────────────────
-static void visualAlign(int target_u) {
-  int ch0 = cur[0];
-  for (uint8_t i = 0; i < cfg::PID_MAX_ITER; i++) {
-    feedWDT();
-    delay(cfg::PID_SETTLE_MS);
-
-    const Block b = getBlockBySig(cfg::PIXY_SIG_TARGET);
-    if (!b.valid()) break;
-
-    const int err = target_u - b.x;
-    if (abs(err) < cfg::PID_TOLERANCE) break;
-
-    const int delta = (int)lroundf(cfg::KP * err);
-    if (delta == 0) break;
-    ch0 = constrain(ch0 + delta, cfg::SERVO_LO, cfg::SERVO_HI);
-
-    Serial.printf("  PID iter=%u err=%d delta=%d ch0=%d\n", i, err, delta, ch0);
-    moveTrap(ch0, cur[1], cur[2], cur[3], cfg::MOVE_FAST_MS);
+static int medianOf(int* a, int n) {
+  for (int i = 0; i < n - 1; i++) {
+    int mi = i;
+    for (int j = i + 1; j < n; j++) if (a[j] < a[mi]) mi = j;
+    if (mi != i) { int t = a[i]; a[i] = a[mi]; a[mi] = t; }
   }
+  return a[n / 2];
 }
 
-// ── 從 JSON 階段物件取出 4 軸角度 ─────────────────
-static bool extractPhase(JsonVariant p, int out[4]) {
-  if (!p.is<JsonObject>()) return false;
-  out[0] = constrain((int)p["ch0"], cfg::SERVO_LO, cfg::SERVO_HI);
-  out[1] = constrain((int)p["ch1"], cfg::SERVO_LO, cfg::SERVO_HI);
-  out[2] = constrain((int)p["ch2"], cfg::SERVO_LO, cfg::SERVO_HI);
-  out[3] = constrain((int)p["ch3"], cfg::SERVO_LO, cfg::GRIPPER_HI);
+// 多幀中位數，過濾單幀雜訊
+static Block getBlockMedian(int sig) {
+  int xs[8], ys[8], ws[8], hs[8];
+  int n = 0;
+  const int N = min((int)cfg::MEDIAN_SAMPLES, 8);
+  for (int i = 0; i < N; i++) {
+    feedWDT();
+    Block b = getBlockBySig(sig);
+    if (b.valid()) {
+      xs[n] = b.x; ys[n] = b.y; ws[n] = b.width; hs[n] = b.height;
+      n++;
+    }
+    delay(cfg::MEDIAN_GAP_MS);
+  }
+  if (n == 0) return Block{};
+  Block r;
+  r.signature = sig;
+  r.x      = medianOf(xs, n);
+  r.y      = medianOf(ys, n);
+  r.width  = medianOf(ws, n);
+  r.height = medianOf(hs, n);
+  return r;
+}
+
+// ── JSON 解析 → phases[] ──────────────────────────
+static bool parsePhases(JsonDocument& doc) {
+  for (uint8_t i = 0; i < NUM_PHASES; i++) {
+    JsonVariant v = doc[PHASE_NAMES[i]];
+    if (!v.is<JsonObject>()) { phases[i].present = false; continue; }
+    phases[i].ch[0]   = constrain((int)v["ch0"], cfg::SERVO_LO, cfg::SERVO_HI);
+    phases[i].ch[1]   = constrain((int)v["ch1"], cfg::SERVO_LO, cfg::SERVO_HI);
+    phases[i].ch[2]   = constrain((int)v["ch2"], cfg::SERVO_LO, cfg::SERVO_HI);
+    phases[i].ch[3]   = constrain((int)v["ch3"], cfg::SERVO_LO, cfg::GRIPPER_HI);
+    phases[i].present = true;
+  }
   return true;
 }
 
-// ── 執行五階段動作序列 ────────────────────────────
-static void executeAngles(DynamicJsonDocument& doc, int target_u) {
-  static const char* const phases[] = {"pick", "grip", "place", "release", "home"};
-  int a[4];
-
-  for (const char* phase : phases) {
-    if (!extractPhase(doc[phase], a)) continue;
-
-    Serial.printf("▶ %s → ch0=%d ch1=%d ch2=%d ch3=%d\n",
-                  phase, a[0], a[1], a[2], a[3]);
-
-    moveTrap(a[0], a[1], a[2], a[3]);
-    delay(300);
-    feedWDT();
-
-    if (target_u > 0 && strcmp(phase, "pick") == 0) {
-      Serial.println("  🎯 視覺修正中...");
-      visualAlign(target_u);
-      delay(200);
-      feedWDT();
-    }
-  }
-}
-
-// ── 與伺服器溝通並執行 ────────────────────────────
-static void sendAndExecute(int tx, int ty, int dx, int dy) {
+// ── HTTP（串流解析 JSON，省 RAM） ──────────────────
+static bool fetchAngles(int tx, int ty, int dx, int dy,
+                        DynamicJsonDocument& doc) {
   char body[96];
   const int n = snprintf(body, sizeof(body),
                          "{\"tx\":%d,\"ty\":%d,\"dx\":%d,\"dy\":%d}",
                          tx, ty, dx, dy);
-  if (n <= 0 || n >= (int)sizeof(body)) {
-    Serial.println("❌ body 編碼失敗");
-    return;
-  }
+  if (n <= 0 || n >= (int)sizeof(body)) return false;
   Serial.printf("📤 POST: %s\n", body);
 
   HTTPClient http;
@@ -224,52 +269,142 @@ static void sendAndExecute(int tx, int ty, int dx, int dy) {
   http.setReuse(false);
 
   int code = -1;
-  String resp;
+  uint16_t backoff = 300;
   for (uint8_t attempt = 0; attempt <= cfg::HTTP_MAX_RETRY; attempt++) {
-    if (!http.begin(cfg::SERVER_URL)) {
-      Serial.println("❌ HTTP begin 失敗");
-      delay(200);
-      continue;
-    }
+    if (!http.begin(cfg::SERVER_URL)) { delay(200); continue; }
     http.addHeader("Content-Type", "application/json");
     code = http.POST((uint8_t*)body, n);
     if (code == 200) {
-      resp = http.getString();
+      const DeserializationError err = deserializeJson(doc, http.getStream());
       http.end();
-      break;
+      if (err) {
+        Serial.printf("❌ JSON 解析失敗: %s\n", err.c_str());
+        return false;
+      }
+      Serial.println("✅ 收到角度");
+      return true;
     }
-    Serial.printf("⚠ HTTP code=%d (重試 %u/%u)\n",
-                  code, attempt + 1, cfg::HTTP_MAX_RETRY);
+    Serial.printf("⚠ HTTP code=%d (重試 %u/%u, %ums)\n",
+                  code, attempt + 1, cfg::HTTP_MAX_RETRY, backoff);
     http.end();
     feedWDT();
-    delay(300);
+    delay(backoff);
+    backoff = min<uint16_t>(backoff * 2, 2000);
   }
-
-  if (code != 200) {
-    Serial.printf("❌ HTTP 失敗 code=%d\n", code);
-    return;
-  }
-
-  Serial.println("✅ 收到角度");
-  DynamicJsonDocument doc(cfg::JSON_BUF_SIZE);
-  const DeserializationError err = deserializeJson(doc, resp);
-  if (err) {
-    Serial.printf("❌ JSON 解析失敗: %s\n", err.c_str());
-    return;
-  }
-  executeAngles(doc, tx);
-  Serial.println("✅ 動作完成");
+  Serial.printf("❌ HTTP 失敗 code=%d\n", code);
+  return false;
 }
 
-// ── WiFi ──────────────────────────────────────────
+// ── 階段切換 ──────────────────────────────────────
+static void enterPhase(int idx) {
+  while (idx < NUM_PHASES && !phases[idx].present) idx++;
+  if (idx >= NUM_PHASES) {
+    Serial.println("✅ 動作完成");
+    S.stage = Stage::IDLE;
+    S.lastVision = millis();
+    return;
+  }
+  const auto& p = phases[idx];
+  Serial.printf("▶ %s → ch0=%d ch1=%d ch2=%d ch3=%d\n",
+                PHASE_NAMES[idx], p.ch[0], p.ch[1], p.ch[2], p.ch[3]);
+  S.phase_idx = idx;
+  S.sub = Sub::PHASE_MOVE;
+  startMotion(p.ch[0], p.ch[1], p.ch[2], p.ch[3], cfg::MOVE_MS);
+}
+
+// ── 執行 FSM ──────────────────────────────────────
+static void tickExecute() {
+  if (S.stage != Stage::EXECUTE) return;
+
+  switch (S.sub) {
+    case Sub::PHASE_MOVE:
+      if (motion.active) return;
+      S.stage_t = millis();
+      S.sub     = Sub::PHASE_SETTLE;
+      break;
+
+    case Sub::PHASE_SETTLE:
+      if (millis() - S.stage_t < cfg::PHASE_SETTLE_MS) return;
+      if (S.target_u > 0 && strcmp(PHASE_NAMES[S.phase_idx], "pick") == 0) {
+        Serial.println("  🎯 視覺修正中...");
+        S.pid_iter     = 0;
+        S.pid_i        = 0.0f;
+        S.pid_prev_err = 0;
+        S.stage_t      = millis();
+        S.sub          = Sub::PID_SETTLE;
+      } else {
+        enterPhase(S.phase_idx + 1);
+      }
+      break;
+
+    case Sub::PID_SETTLE: {
+      if (millis() - S.stage_t < cfg::PID_SETTLE_MS) return;
+      if (S.pid_iter >= cfg::PID_MAX_ITER) {
+        enterPhase(S.phase_idx + 1);
+        return;
+      }
+      const Block b = getBlockMedian(cfg::PIXY_SIG_TARGET);
+      if (!b.valid()) { enterPhase(S.phase_idx + 1); return; }
+      const int err = S.target_u - b.x;
+      if (abs(err) < cfg::PID_TOLERANCE) {
+        enterPhase(S.phase_idx + 1);
+        return;
+      }
+      S.pid_i = constrain(S.pid_i + (float)err, -cfg::I_MAX, cfg::I_MAX);
+      const int delta = (int)lroundf(
+        cfg::KP * (float)err +
+        cfg::KI * S.pid_i +
+        cfg::KD * (float)(err - S.pid_prev_err));
+      S.pid_prev_err = err;
+      if (delta == 0) { enterPhase(S.phase_idx + 1); return; }
+      const int ch0 = constrain(cur[0] + delta, cfg::SERVO_LO, cfg::SERVO_HI);
+      Serial.printf("  PID iter=%u err=%d i=%.1f Δ=%d ch0=%d\n",
+                    S.pid_iter, err, S.pid_i, delta, ch0);
+      S.pid_iter++;
+      startMotion(ch0, cur[1], cur[2], cur[3], cfg::MOVE_FAST_MS);
+      S.sub = Sub::PID_MOVE;
+      break;
+    }
+
+    case Sub::PID_MOVE:
+      if (motion.active) return;
+      S.stage_t = millis();
+      S.sub     = Sub::PID_SETTLE;
+      break;
+  }
+}
+
+// ── IDLE：間隔到了就掃描+POST+進入 EXECUTE ─────────
+static void tickIdle() {
+  if (S.stage != Stage::IDLE) return;
+  if (motion.active) return;
+  if (millis() - S.lastVision < cfg::VISION_INTERVAL_MS) return;
+  S.lastVision = millis();
+
+  const Block target = getBlockMedian(cfg::PIXY_SIG_TARGET);
+  const Block dest   = getBlockMedian(cfg::PIXY_SIG_DEST);
+  if (!target.valid()) { Serial.println("👁 找不到目標物"); return; }
+  if (!dest.valid())   { Serial.println("👁 找不到放置目的地"); return; }
+
+  Serial.printf("👁 目標:(%d,%d) 目的地:(%d,%d)\n",
+                target.x, target.y, dest.x, dest.y);
+
+  DynamicJsonDocument doc(cfg::JSON_BUF_SIZE);
+  if (!fetchAngles(target.x, target.y, dest.x, dest.y, doc)) return;
+  if (!parsePhases(doc)) return;
+
+  S.target_u = target.x;
+  S.stage    = Stage::EXECUTE;
+  enterPhase(0);
+}
+
+// ── WiFi / Watchdog ──────────────────────────────
 static bool wifiConnect() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(cfg::SSID, cfg::PASS);
   Serial.print("WiFi 連線中");
   for (int i = 0; i < 40 && WiFi.status() != WL_CONNECTED; i++) {
-    feedWDT();
-    delay(500);
-    Serial.print('.');
+    feedWDT(); delay(500); Serial.print('.');
   }
   Serial.println();
   if (WiFi.status() != WL_CONNECTED) {
@@ -280,15 +415,14 @@ static bool wifiConnect() {
   return true;
 }
 
-// ── 看門狗 ────────────────────────────────────────
 static void initWatchdog() {
   esp_task_wdt_deinit();
-  esp_task_wdt_config_t wdt = {
+  esp_task_wdt_config_t w = {
     .timeout_ms     = cfg::WDT_TIMEOUT_MS,
     .idle_core_mask = 0,
     .trigger_panic  = true,
   };
-  esp_task_wdt_init(&wdt);
+  esp_task_wdt_init(&w);
   esp_task_wdt_add(nullptr);
 }
 
@@ -303,8 +437,11 @@ void setup() {
   Wire.begin(cfg::SDA_PWM, cfg::SCL_PWM);
   pwm.begin();
   pwm.setPWMFreq(cfg::PWM_FREQ);
-  moveTrap(cfg::HOME_CH0, cfg::HOME_CH1, cfg::HOME_CH2, cfg::HOME_CH3,
-           cfg::MOVE_INIT_MS);
+
+  // 初始 homing：阻塞等到位
+  startMotion(cfg::HOME_CH0, cfg::HOME_CH1, cfg::HOME_CH2, cfg::HOME_CH3,
+              cfg::MOVE_INIT_MS);
+  while (motion.active) { tickMotion(); feedWDT(); delay(5); }
   Serial.println("✅ 伺服馬達初始化完成");
 
   Wire1.begin(cfg::SDA_PIXY, cfg::SCL_PIXY);
@@ -315,26 +452,9 @@ void setup() {
 
 void loop() {
   feedWDT();
+  if (WiFi.status() != WL_CONNECTED) { WiFi.reconnect(); delay(500); return; }
 
-  if (WiFi.status() != WL_CONNECTED) {
-    WiFi.reconnect();
-    delay(500);
-    return;
-  }
-
-  if (busy || millis() - lastVision < cfg::VISION_INTERVAL_MS) return;
-  lastVision = millis();
-
-  const Block target = getBlockBySig(cfg::PIXY_SIG_TARGET);
-  const Block dest   = getBlockBySig(cfg::PIXY_SIG_DEST);
-
-  if (!target.valid()) { Serial.println("👁 找不到目標物"); return; }
-  if (!dest.valid())   { Serial.println("👁 找不到放置目的地"); return; }
-
-  Serial.printf("👁 目標:(%d,%d) 目的地:(%d,%d)\n",
-                target.x, target.y, dest.x, dest.y);
-  busy = true;
-  sendAndExecute(target.x, target.y, dest.x, dest.y);
-  busy = false;
-  lastVision = millis();
+  tickMotion();    // 每 tick 更新一次 PWM（若有 active motion）
+  tickExecute();   // 推進階段/PID FSM
+  tickIdle();      // 沒事就掃 vision，有目標就啟動
 }
