@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Arduino / PlatformIO
+.pio/
+build/
+*.bin
+*.elf
+
+# Editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
