@@ -50,61 +50,104 @@ Arduino IDE 或 PlatformIO，安裝：
 
 ---
 
-## 設定
+## 參數參考
 
-所有可調參數都在 `banyus_arm.ino` 頂部的 `namespace cfg`。
+所有可調參數都集中在 `banyus_arm.ino` 頂部的 `namespace cfg`。下表列出每個常數的用途、預設值、單位、合理範圍與調整方向。
 
 ### WiFi / 伺服器
 
-```cpp
-constexpr char SSID[]       = "your_ssid";
-constexpr char PASS[]       = "your_password";
-constexpr char SERVER_URL[] = "http://10.20.171.77:5000/arm";
-```
+| 參數 | 預設 | 說明 / 調整方向 |
+|---|---|---|
+| `SSID` | `"1234567"` | WiFi 網路名稱 |
+| `PASS` | `"asdfghjk"` | WiFi 密碼 |
+| `SERVER_URL` | `"http://10.20.171.77:5000/arm"` | 後端 HTTP 端點（含 path） |
+| `HTTP_TIMEOUT_MS` | `5000` ms | 單次 HTTP 請求逾時。網路差就拉長 |
+| `HTTP_MAX_RETRY` | `2` | 失敗重試次數，實際嘗試 N+1 次 |
 
-### 伺服角度限位
+### I2C 腳位 / 位址
 
-```cpp
-SERVO_LO   = 5    // 各軸最小角度
-SERVO_HI   = 175  // 各軸最大角度
-GRIPPER_HI = 90   // ch3（夾爪）最大張開
-PWM_MIN    = 150  // PWM 對應 0°
-PWM_MAX    = 600  // PWM 對應 180°
-```
+| 參數 | 預設 | 說明 |
+|---|---|---|
+| `PWM_ADDR` | `0x40` | PCA9685 I2C 位址（板上 A0–A5 跳線可改） |
+| `PIXY_ADDR` | `0x54` | Pixy2 I2C 位址（PixyMon 設定中可改） |
+| `SDA_PWM` / `SCL_PWM` | `21` / `22` | PCA9685 用 `Wire`（預設 I2C 通道） |
+| `SDA_PIXY` / `SCL_PIXY` | `4` / `5` | Pixy2 用 `Wire1`（第二 I2C 通道） |
 
-### Home 位置
+### 伺服馬達
 
-```cpp
-HOME_CH0 = 90, HOME_CH1 = 90, HOME_CH2 = 120, HOME_CH3 = 5
-```
+| 參數 | 預設 | 單位 | 說明 |
+|---|---|---|---|
+| `PWM_FREQ` | `50` | Hz | PWM 頻率。類比伺服 50Hz，數位伺服可到 333Hz |
+| `PWM_MIN` | `150` | tick | 對應 0° 的 PWM 值（PCA9685 為 12-bit, 0–4095）。≈ 500µs 脈寬 |
+| `PWM_MAX` | `600` | tick | 對應 180° 的 PWM 值。≈ 2500µs 脈寬 |
+| `SERVO_LO` | `5` | ° | 各軸最小允許角度（避免撞限位） |
+| `SERVO_HI` | `175` | ° | 各軸最大允許角度 |
+| `GRIPPER_HI` | `90` | ° | 夾爪（ch3）最大角度，依機構決定方向 |
+
+> **校正 PWM_MIN/MAX**：先設 150/600，下命令到 0° 和 180°，量實際角度，按比例修正。不同廠牌伺服可差 ±15%。
+
+### Home 位置（開機歸位的安全姿勢）
+
+| 參數 | 預設 | 說明 |
+|---|---|---|
+| `HOME_CH0` | `90` | 底座旋轉，置中 |
+| `HOME_CH1` | `90` | 大臂（肩），中位 |
+| `HOME_CH2` | `120` | 小臂（肘），稍微抬起避免撞地 |
+| `HOME_CH3` | `5` | 夾爪，閉合狀態 |
 
 ### 動作時間
 
-```cpp
-MOVE_MS         = 1200  // 一般階段動作
-MOVE_FAST_MS    = 400   // PID 小幅修正
-MOVE_INIT_MS    = 2000  // 開機歸位
-PHASE_SETTLE_MS = 300   // 每階段完成後等待
-```
+| 參數 | 預設 | 單位 | 說明 |
+|---|---|---|---|
+| `MOVE_STEPS` | `40` | step | 一次移動分幾步寫 PWM。↑ 越平滑但 CPU 用量更高 |
+| `MOVE_MS` | `1200` | ms | 一般階段動作時間。↓ 動作快但易抖；↑ 慢但穩 |
+| `MOVE_FAST_MS` | `400` | ms | PID 小幅修正動作時間 |
+| `MOVE_INIT_MS` | `2000` | ms | 開機歸位時間。較長以保安全 |
+| `PHASE_SETTLE_MS` | `300` | ms | 每階段動作完成後等待，讓伺服真正穩定 |
 
-### PID
-
-```cpp
-KP = 0.43, KI = 0.05, KD = 0.10
-I_MAX         = 30   // 積分項夾鉗（anti-windup）
-PID_MAX_ITER  = 3    // 最多修正次數
-PID_TOLERANCE = 5    // 像素誤差容忍
-PID_SETTLE_MS = 300  // 每次 iter 之間等待伺服穩定
-```
+> 動作解析度 = `MOVE_MS / MOVE_STEPS` = 30ms/step。`tickMotion` 中若同一 step 重複進入會略過，不會多餘寫 I2C。
 
 ### 視覺
 
-```cpp
-VISION_INTERVAL_MS = 3000  // 每 3 秒掃描一次
-PIXY_SIG_TARGET    = 1     // signature 1 = 目標物
-PIXY_SIG_DEST      = 2     // signature 2 = 放置位置
-MEDIAN_SAMPLES     = 3     // 取 3 幀中位數
-MEDIAN_GAP_MS      = 20    // 幀間間隔
+| 參數 | 預設 | 單位 | 說明 |
+|---|---|---|---|
+| `VISION_INTERVAL_MS` | `3000` | ms | IDLE 狀態下兩次掃描的最短間隔 |
+| `PIXY_SIG_TARGET` | `1` | — | Pixy2 中標記目標物的 signature 編號 |
+| `PIXY_SIG_DEST` | `2` | — | 標記放置位置的 signature 編號 |
+| `PIXY_MAX_BLOCKS` | `4` | block | 一次 I2C 請求要拉的最大 block 數 |
+| `PIXY_READ_DELAY_MS` | `5` | ms | Pixy2 對請求的反應延遲 |
+| `MEDIAN_SAMPLES` | `3` | frame | 中位數樣本數（建議奇數 3 / 5 / 7） |
+| `MEDIAN_GAP_MS` | `20` | ms | 中位數樣本間的等待 |
+
+### PID（視覺對準，僅作用於 ch0）
+
+| 參數 | 預設 | 說明 |
+|---|---|---|
+| `KP` | `0.43` | 比例增益。每 1 px 誤差 → 修正角度數。↑ 反應快但易震盪 |
+| `KI` | `0.05` | 積分增益。消除穩態誤差。↑ 太多會 windup |
+| `KD` | `0.10` | 微分增益。抑制超調。↑ 太多對雜訊敏感 |
+| `I_MAX` | `30` | 積分項夾鉗上下限，防止 windup |
+| `PID_MAX_ITER` | `3` | 最多修正次數，避免無限循環 |
+| `PID_TOLERANCE` | `5` | 誤差 < 此值（像素）視為達成 |
+| `PID_SETTLE_MS` | `300` | ms。每次 iter 等待伺服穩定 |
+
+> **調校順序**：先 KI = KD = 0，調 KP 到剛好不震盪 → 加 KD 抑制超調 → 最後加 KI 消除穩態誤差。
+
+### 系統 / 緩衝
+
+| 參數 | 預設 | 說明 |
+|---|---|---|
+| `WDT_TIMEOUT_MS` | `30000` ms | Task Watchdog 逾時。任一操作（含 HTTP）超過就 panic 重啟 |
+| `JSON_BUF_SIZE` | `2048` B | JSON 解析緩衝。5 階段 × ~80B/階段 ≈ 400B，2KB 已有充裕餘裕 |
+| `PCA_LED0_ON_L` | `0x06` | PCA9685 LED0_ON_L 暫存器位址，批次寫入起點 |
+
+### 推算公式速查
+
+```
+PWM_value     = map(angle, 0, 180, PWM_MIN, PWM_MAX)
+pulse_width   = PWM_value / 4096 × (1000 / PWM_FREQ)  ms
+step_duration = MOVE_MS / MOVE_STEPS                  ms
+PID_total_ms  = PID_MAX_ITER × (PID_SETTLE_MS + MOVE_FAST_MS)
 ```
 
 ---
