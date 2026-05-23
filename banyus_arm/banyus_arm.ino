@@ -3,6 +3,7 @@
 
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <ESPmDNS.h>
 #include <Adafruit_PWMServoDriver.h>
 #include <Wire.h>
 #include <esp_task_wdt.h>
@@ -14,6 +15,7 @@ namespace cfg {
   constexpr char SSID[]       = "1234567";
   constexpr char PASS[]       = "asdfghjk";
   constexpr char SERVER_URL[] = "http://10.20.171.77:5000/arm";
+  constexpr char MDNS_HOSTNAME[] = "banyus";        // → banyus.local
   constexpr uint16_t HTTP_TIMEOUT_MS = 5000;
   constexpr uint8_t  HTTP_MAX_RETRY  = 2;
 
@@ -412,6 +414,12 @@ static bool wifiConnect() {
     return false;
   }
   Serial.printf("✅ WiFi 連線成功 %s\n", WiFi.localIP().toString().c_str());
+
+  if (MDNS.begin(cfg::MDNS_HOSTNAME)) {
+    Serial.printf("✅ mDNS：http://%s.local\n", cfg::MDNS_HOSTNAME);
+  } else {
+    Serial.println("⚠ mDNS 啟動失敗");
+  }
   return true;
 }
 

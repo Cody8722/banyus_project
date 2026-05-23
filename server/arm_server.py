@@ -21,7 +21,7 @@ from flask import Flask, jsonify, request
 # ── 設定常數 ─────────────────────────────────────
 HOST = "0.0.0.0"
 PORT = 5000
-ESP32_URL     = "http://10.20.171.112:80"
+ESP32_URL     = "http://banyus.local"   # ESP32 端註冊的 mDNS 名稱，免擔心 DHCP 變動
 ESP32_TIMEOUT = 30   # s
 
 OBJECT_Z_MM      = 10
