@@ -1,365 +1,235 @@
-// Robotic arm controller — ESP32 + PCA9685 + Pixy2
-// 純 HTTP server 架構：/vision 回傳 Pixy 座標、/execute 收角度後執行
-// 加值：S-curve 平滑運動、視覺 PID 對準、Pixy 多幀中位數、PCA9685 批次寫
-
 #include <WiFi.h>
-#include <WebServer.h>
-#include <ESPmDNS.h>
+#include <HTTPClient.h>
 #include <Adafruit_PWMServoDriver.h>
 #include <Wire.h>
 #include <esp_task_wdt.h>
 #include <ArduinoJson.h>
 
-// ── 設定 ─────────────────────────────────────────
-namespace cfg {
-  // WiFi
-  constexpr char SSID[]          = "1234567";
-  constexpr char PASS[]          = "asdfghjk";
-  constexpr char MDNS_HOSTNAME[] = "banyus";   // → banyus.local
-  constexpr uint16_t HTTP_PORT   = 80;
-
-  // I2C
-  constexpr uint8_t  PWM_ADDR  = 0x40;
-  constexpr uint8_t  PIXY_ADDR = 0x54;
-  constexpr uint8_t  SDA_PWM   = 21, SCL_PWM  = 22;
-  constexpr uint8_t  SDA_PIXY  = 4,  SCL_PIXY = 5;
-
-  // Servo
-  constexpr uint16_t PWM_FREQ   = 50;
-  constexpr uint16_t PWM_MIN    = 150;   // 0°
-  constexpr uint16_t PWM_MAX    = 600;   // 180°
-  constexpr uint8_t  SERVO_LO   = 5;
-  constexpr uint8_t  SERVO_HI   = 175;
-  constexpr uint8_t  GRIPPER_HI = 90;
-
-  // Home
-  constexpr uint8_t HOME_CH0 = 90, HOME_CH1 = 90, HOME_CH2 = 120, HOME_CH3 = 5;
-
-  // Motion
-  constexpr uint16_t MOVE_STEPS      = 40;
-  constexpr uint16_t MOVE_MS         = 1000;   // 階段一般動作時間
-  constexpr uint16_t MOVE_FAST_MS    = 350;    // PID 小幅修正時間
-  constexpr uint16_t MOVE_INIT_MS    = 2000;   // 開機歸位
-  constexpr uint16_t PHASE_SETTLE_MS = 150;    // 階段間 settle
-
-  // Vision (median sampling 過濾單幀雜訊)
-  constexpr uint8_t  PIXY_SIG_TARGET    = 1;
-  constexpr uint8_t  PIXY_SIG_DEST      = 2;
-  constexpr uint8_t  PIXY_MAX_BLOCKS    = 4;
-  constexpr uint8_t  PIXY_READ_DELAY_MS = 5;
-  constexpr uint8_t  MEDIAN_SAMPLES     = 3;
-  constexpr uint8_t  MEDIAN_GAP_MS      = 15;
-
-  // PID（視覺對準，僅作用於 ch0）
-  constexpr float    KP            = 0.43f;
-  constexpr float    KI            = 0.05f;
-  constexpr float    KD            = 0.10f;
-  constexpr float    I_MAX         = 30.0f;
-  constexpr uint8_t  PID_MAX_ITER  = 3;
-  constexpr uint8_t  PID_TOLERANCE = 5;        // 像素
-  constexpr uint16_t PID_SETTLE_MS = 220;
-
-  // 系統
-  constexpr uint32_t WDT_TIMEOUT_MS = 30000;
-  constexpr uint8_t  PCA_LED0_ON_L  = 0x06;
-}
-
-// ── 全域 ─────────────────────────────────────────
 struct Block {
-  int signature = 0;
-  int x = -1, y = -1, width = 0, height = 0;
-  bool valid() const { return x >= 0; }
+  int signature, x, y, width, height;
 };
 
-static WebServer              server(cfg::HTTP_PORT);
-static Adafruit_PWMServoDriver pwm(cfg::PWM_ADDR);
-static int                    cur[4] = {cfg::HOME_CH0, cfg::HOME_CH1, cfg::HOME_CH2, cfg::HOME_CH3};
-static volatile bool          busy   = false;     // /execute 執行中時擋掉 /vision 與重入
+const char* ssid       = "1234567";
+const char* pass       = "asdfghjk";
+const char* server_url = "http://10.20.171.77:5000/arm";
 
-// ── 工具 ─────────────────────────────────────────
-static inline int  angleToPWM(int a) { return map(a, 0, 180, cfg::PWM_MIN, cfg::PWM_MAX); }
-static inline void feedWDT()         { esp_task_wdt_reset(); }
+Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
 
-// 5 階 smoothstep（S-curve）：起終點 v 與 a 皆為 0，jerk-limited
-static inline float sCurveRatio(float t) {
-  return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
+#define PIXY_ADDR 0x54
+
+unsigned long lastVision  = 0;
+const int VISION_INTERVAL = 3000;
+bool busy = false;
+
+int cur[4] = {90, 90, 120, 5};
+
+int angleToPWM(int angle) {
+  return map(angle, 0, 180, 150, 600);
 }
 
-// 一次 I2C 寫入 4 軸 PWM（PCA9685 auto-increment）
-static void writePWM4(const int angles[4]) {
-  Wire.beginTransmission(cfg::PWM_ADDR);
-  Wire.write(cfg::PCA_LED0_ON_L);
-  for (int ch = 0; ch < 4; ch++) {
-    const int a = constrain(angles[ch], 0, cfg::SERVO_HI);
-    const uint16_t v = angleToPWM(a);
-    Wire.write(0);                 // ON_L
-    Wire.write(0);                 // ON_H
-    Wire.write(v & 0xFF);          // OFF_L
-    Wire.write((v >> 8) & 0xFF);   // OFF_H
-  }
-  Wire.endTransmission();
-}
-
-// ── S-curve 平滑運動（block but 期間仍服務 HTTP） ────
-static void moveSmooth(const int target[4], int total_ms = cfg::MOVE_MS) {
-  const int steps = cfg::MOVE_STEPS;
-  const int dt    = max(1, total_ms / steps);
-  int start[4]; memcpy(start, cur, sizeof(cur));
+// ── S-curve 平滑運動（取代原 moveTrap） ───────────
+// 5 階 smoothstep s(t)=t³(6t²−15t+10)：起終點 v 與 a 皆為 0，jerk-limited
+void moveSmooth(int ch0, int ch1, int ch2, int ch3, int total_ms = 1200) {
+  int target[4] = {ch0, ch1, ch2, ch3};
+  const int steps = 40;
 
   for (int s = 1; s <= steps; s++) {
-    const float r = sCurveRatio((float)s / steps);
-    int a[4];
+    float t = (float)s / steps;
+    float ratio = t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
+
     for (int ch = 0; ch < 4; ch++) {
-      a[ch] = start[ch] + (int)((target[ch] - start[ch]) * r);
+      int angle = cur[ch] + (int)((target[ch] - cur[ch]) * ratio);
+      pwm.setPWM(ch, 0, angleToPWM(constrain(angle, 0, 175)));
     }
-    writePWM4(a);
-    feedWDT();
-    server.handleClient();   // 維持並發
-    delay(dt);
+    esp_task_wdt_reset();
+    delay(total_ms / steps);
   }
-  memcpy(cur, target, sizeof(cur));
+  for (int ch = 0; ch < 4; ch++) cur[ch] = target[ch];
 }
 
-// ── Pixy2 I2C 讀取 ───────────────────────────────
-static Block getBlockBySig(int sig) {
-  Block b;
-  Wire1.beginTransmission(cfg::PIXY_ADDR);
-  Wire1.write(0x20); Wire1.write(0x00); Wire1.write(cfg::PIXY_MAX_BLOCKS);
+// ── Pixy2 I2C 讀取 ────────────────────────────────
+Block getBlockBySig(int sig) {
+  Block b = {0, -1, -1, 0, 0};
+  Wire1.beginTransmission(PIXY_ADDR);
+  Wire1.write(0x20); Wire1.write(0x00); Wire1.write(0x04);
   Wire1.endTransmission();
-  delay(cfg::PIXY_READ_DELAY_MS);
+  delay(5);
 
   int count = 0;
-  Wire1.requestFrom(cfg::PIXY_ADDR, (uint8_t)2);
-  if (Wire1.available() >= 2) { Wire1.read(); count = Wire1.read(); }
-  if (count <= 0) return b;
+  Wire1.requestFrom(PIXY_ADDR, 2);
+  if (Wire1.available() >= 2) {
+    Wire1.read(); count = Wire1.read();
+  }
 
   for (int i = 0; i < count; i++) {
-    if (Wire1.requestFrom(cfg::PIXY_ADDR, (uint8_t)14) < 14) continue;
-    if (Wire1.available() < 14) continue;
-    for (int k = 0; k < 4; k++) Wire1.read();
-    const int s = Wire1.read() | (Wire1.read() << 8);
-    const int x = Wire1.read() | (Wire1.read() << 8);
-    const int y = Wire1.read() | (Wire1.read() << 8);
-    const int w = Wire1.read() | (Wire1.read() << 8);
-    const int h = Wire1.read() | (Wire1.read() << 8);
-    if (s == sig) { b = {s, x, y, w, h}; return b; }
+    Wire1.requestFrom(PIXY_ADDR, 14);
+    if (Wire1.available() >= 14) {
+      Wire1.read(); Wire1.read(); Wire1.read(); Wire1.read();
+      int s = Wire1.read() | (Wire1.read() << 8);
+      int x = Wire1.read() | (Wire1.read() << 8);
+      int y = Wire1.read() | (Wire1.read() << 8);
+      int w = Wire1.read() | (Wire1.read() << 8);
+      int h = Wire1.read() | (Wire1.read() << 8);
+      if (s == sig) { b = {s, x, y, w, h}; return b; }
+    }
   }
   return b;
 }
 
-static int medianOf(int* a, int n) {
-  for (int i = 0; i < n - 1; i++) {
-    int mi = i;
-    for (int j = i + 1; j < n; j++) if (a[j] < a[mi]) mi = j;
-    if (mi != i) { int t = a[i]; a[i] = a[mi]; a[mi] = t; }
-  }
-  return a[n / 2];
-}
+// ── 完整 PID 視覺修正（取代原 P-only visualPID） ──
+// 對準目標物像素 u，僅修正 ch0；KP 為原值 0.4×1.075≈0.43，加 KI/KD
+int visualPID(int target_u, int max_iter = 3) {
+  const float Kp    = 0.43f;
+  const float Ki    = 0.05f;
+  const float Kd    = 0.10f;
+  const float I_MAX = 30.0f;
 
-static Block getBlockMedian(int sig) {
-  int xs[8], ys[8], ws[8], hs[8];
-  int n = 0;
-  const int N = min((int)cfg::MEDIAN_SAMPLES, 8);
-  for (int i = 0; i < N; i++) {
-    feedWDT();
-    Block b = getBlockBySig(sig);
-    if (b.valid()) {
-      xs[n] = b.x; ys[n] = b.y; ws[n] = b.width; hs[n] = b.height;
-      n++;
-    }
-    delay(cfg::MEDIAN_GAP_MS);
-  }
-  if (n == 0) return Block{};
-  Block r;
-  r.signature = sig;
-  r.x      = medianOf(xs, n);
-  r.y      = medianOf(ys, n);
-  r.width  = medianOf(ws, n);
-  r.height = medianOf(hs, n);
-  return r;
-}
-
-// ── 視覺 PID 對準（pick 後做 ch0 修正） ──────────
-static void visualPID(int target_u) {
-  float pid_i = 0.0f;
+  int   ch0      = cur[0];
+  float integral = 0.0f;
   int   prev_err = 0;
 
-  for (uint8_t iter = 0; iter < cfg::PID_MAX_ITER; iter++) {
-    feedWDT();
-    server.handleClient();
-    delay(cfg::PID_SETTLE_MS);
+  for (int i = 0; i < max_iter; i++) {
+    esp_task_wdt_reset();
+    delay(300);  // 等馬達穩定
 
-    const Block b = getBlockMedian(cfg::PIXY_SIG_TARGET);
-    if (!b.valid()) break;
+    Block b = getBlockBySig(1);
+    if (b.x == -1) break;
 
-    const int err = target_u - b.x;
-    if (abs(err) < cfg::PID_TOLERANCE) break;
+    int error = target_u - b.x;
+    if (abs(error) < 5) break;  // 收斂
 
-    pid_i = constrain(pid_i + (float)err, -cfg::I_MAX, cfg::I_MAX);
-    const int delta = (int)lroundf(
-      cfg::KP * (float)err +
-      cfg::KI * pid_i +
-      cfg::KD * (float)(err - prev_err));
-    prev_err = err;
+    integral = constrain(integral + (float)error, -I_MAX, I_MAX);
+    float correction = Kp * error + Ki * integral + Kd * (error - prev_err);
+    prev_err = error;
+
+    int delta = (int)lroundf(correction);
     if (delta == 0) break;
+    ch0 = constrain(ch0 + delta, 5, 175);
 
-    const int ch0 = constrain(cur[0] + delta, cfg::SERVO_LO, cfg::SERVO_HI);
-    Serial.printf("  PID iter=%u err=%d i=%.1f Δ=%d ch0=%d\n",
-                  iter, err, pid_i, delta, ch0);
-    const int target[4] = {ch0, cur[1], cur[2], cur[3]};
-    moveSmooth(target, cfg::MOVE_FAST_MS);
+    Serial.printf("  PID iter=%d err=%d i=%.1f Δ=%d ch0=%d\n",
+                  i, error, integral, delta, ch0);
+
+    moveSmooth(ch0, cur[1], cur[2], cur[3], 400);
   }
+  return ch0;
 }
 
-// ── 執行 5 階段（可選 target_u 啟動 pick 後的 PID） ─
-static void executeAngles(JsonDocument& doc) {
-  static const char* const PHASES[] = {"pick", "grip", "place", "release", "home"};
-  const int target_u = doc["target_u"] | -1;
+// ── 執行動作序列 ──────────────────────────────────
+void executeAngles(DynamicJsonDocument& doc, int target_u) {
+  const char* phases[] = {"pick", "grip", "place", "release", "home"};
 
   for (int i = 0; i < 5; i++) {
-    if (!doc[PHASES[i]].is<JsonObject>()) continue;
-    JsonObject p = doc[PHASES[i]];
-    const int a[4] = {
-      constrain((int)p["ch0"], cfg::SERVO_LO, cfg::SERVO_HI),
-      constrain((int)p["ch1"], cfg::SERVO_LO, cfg::SERVO_HI),
-      constrain((int)p["ch2"], cfg::SERVO_LO, cfg::SERVO_HI),
-      constrain((int)p["ch3"], cfg::SERVO_LO, cfg::GRIPPER_HI),
-    };
-    Serial.printf("▶ %s → ch0=%d ch1=%d ch2=%d ch3=%d\n",
-                  PHASES[i], a[0], a[1], a[2], a[3]);
-    moveSmooth(a, cfg::MOVE_MS);
+    if (!doc.containsKey(phases[i])) continue;
 
-    if (target_u > 0 && strcmp(PHASES[i], "pick") == 0) {
-      Serial.println("  🎯 視覺 PID 修正");
+    JsonObject p = doc[phases[i]];
+    int ch0 = constrain((int)p["ch0"], 5, 175);
+    int ch1 = constrain((int)p["ch1"], 5, 175);
+    int ch2 = constrain((int)p["ch2"], 5, 175);
+    int ch3 = constrain((int)p["ch3"], 5, 90);
+
+    Serial.printf("▶ %s → ch0=%d ch1=%d ch2=%d ch3=%d\n",
+                  phases[i], ch0, ch1, ch2, ch3);
+
+    moveSmooth(ch0, ch1, ch2, ch3);
+    delay(300);
+    esp_task_wdt_reset();
+
+    // pick 之後做 PID 對準
+    if (strcmp(phases[i], "pick") == 0 && target_u > 0) {
+      Serial.println("  🎯 視覺 PID 修正中...");
       visualPID(target_u);
     }
-
-    // 階段間 settle，期間繼續服務 HTTP
-    const unsigned long t0 = millis();
-    while (millis() - t0 < cfg::PHASE_SETTLE_MS) {
-      feedWDT();
-      server.handleClient();
-      delay(5);
-    }
   }
 }
 
-// ── HTTP handlers ────────────────────────────────
-static void sendJson(int code, const char* body) {
-  server.send(code, "application/json", body);
-}
+void sendAndExecute(int tx, int ty, int dx, int dy) {
+  HTTPClient http;
+  http.begin(server_url);
+  http.addHeader("Content-Type", "application/json");
 
-// POST /execute  — 收 5 階段角度 JSON（可附 "target_u" 開啟 PID）
-static void handleExecute() {
-  if (busy) { sendJson(503, "{\"error\":\"busy\"}"); return; }
-  if (!server.hasArg("plain")) { sendJson(400, "{\"error\":\"no body\"}"); return; }
+  String body = "{\"tx\":" + String(tx) + ",\"ty\":" + String(ty) +
+                ",\"dx\":" + String(dx) + ",\"dy\":" + String(dy) + "}";
 
-  const String body = server.arg("plain");
-  Serial.printf("📥 /execute: %s\n", body.c_str());
+  Serial.printf("📤 POST: %s\n", body.c_str());
+  int code = http.POST(body);
 
-  DynamicJsonDocument doc(2048);
-  const DeserializationError err = deserializeJson(doc, body);
-  if (err) {
-    Serial.printf("⚠ JSON 解析失敗: %s\n", err.c_str());
-    sendJson(400, "{\"error\":\"bad json\"}");
-    return;
+  if (code == 200) {
+    String resp = http.getString();
+    Serial.printf("✅ 收到角度\n");
+    DynamicJsonDocument doc(2048);
+    deserializeJson(doc, resp);
+    executeAngles(doc, tx);
+    Serial.println("✅ 動作完成");
+  } else {
+    Serial.printf("❌ HTTP 失敗 code=%d\n", code);
   }
 
-  busy = true;
-  sendJson(200, "{\"ok\":true}");     // 立刻回，動作於本 handler 內阻塞執行
-  executeAngles(doc);
-  busy = false;
-  Serial.println("✅ 動作完成");
+  http.end();
 }
 
-// GET /vision  — 回傳 Pixy 中位數座標
-static void handleVision() {
-  if (busy) { sendJson(503, "{\"error\":\"busy\"}"); return; }
-
-  const Block target = getBlockMedian(cfg::PIXY_SIG_TARGET);
-  const Block dest   = getBlockMedian(cfg::PIXY_SIG_DEST);
-
-  char buf[160];
-  snprintf(buf, sizeof(buf),
-           "{\"target_found\":%s,\"dest_found\":%s,"
-           "\"tx\":%d,\"ty\":%d,\"dx\":%d,\"dy\":%d}",
-           target.valid() ? "true" : "false",
-           dest.valid()   ? "true" : "false",
-           target.x, target.y, dest.x, dest.y);
-  server.send(200, "application/json", buf);
-}
-
-// GET /health
-static void handleHealth() {
-  char buf[80];
-  snprintf(buf, sizeof(buf),
-           "{\"busy\":%s,\"ch\":[%d,%d,%d,%d]}",
-           busy ? "true" : "false",
-           cur[0], cur[1], cur[2], cur[3]);
-  sendJson(200, buf);
-}
-
-static void handleNotFound() {
-  sendJson(404, "{\"error\":\"not found\"}");
-}
-
-// ── setup / loop ─────────────────────────────────
 void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println("🚀 啟動中...");
 
   esp_task_wdt_deinit();
-  esp_task_wdt_config_t wdt_cfg = {
-    .timeout_ms     = cfg::WDT_TIMEOUT_MS,
+  esp_task_wdt_config_t wdt_config = {
+    .timeout_ms = 30000,
     .idle_core_mask = 0,
-    .trigger_panic  = true,
+    .trigger_panic = true
   };
-  esp_task_wdt_init(&wdt_cfg);
-  esp_task_wdt_add(nullptr);
+  esp_task_wdt_init(&wdt_config);
+  esp_task_wdt_add(NULL);
 
-  Wire.begin(cfg::SDA_PWM, cfg::SCL_PWM);
+  Wire.begin(21, 22);
   pwm.begin();
-  pwm.setPWMFreq(cfg::PWM_FREQ);
+  pwm.setPWMFreq(50);
 
-  // 開機 home（S-curve 平滑）
-  const int home[4] = {cfg::HOME_CH0, cfg::HOME_CH1, cfg::HOME_CH2, cfg::HOME_CH3};
-  moveSmooth(home, cfg::MOVE_INIT_MS);
+  moveSmooth(90, 90, 120, 5, 2000);
   Serial.println("✅ 伺服馬達初始化完成");
 
-  Wire1.begin(cfg::SDA_PIXY, cfg::SCL_PIXY);
+  Wire1.begin(4, 5);
   Serial.println("✅ Pixy2 I2C 初始化完成");
 
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(cfg::SSID, cfg::PASS);
+  WiFi.begin(ssid, pass);
   Serial.print("WiFi 連線中");
-  for (int i = 0; i < 40 && WiFi.status() != WL_CONNECTED; i++) {
-    feedWDT(); delay(500); Serial.print('.');
+  int retries = 0;
+  while (WiFi.status() != WL_CONNECTED && retries < 40) {
+    esp_task_wdt_reset(); delay(500); Serial.print("."); retries++;
   }
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("\n❌ WiFi 失敗，重啟");
     ESP.restart();
   }
-  Serial.printf("\n✅ WiFi 連線成功 %s\n", WiFi.localIP().toString().c_str());
-
-  if (MDNS.begin(cfg::MDNS_HOSTNAME)) {
-    Serial.printf("✅ mDNS: http://%s.local\n", cfg::MDNS_HOSTNAME);
-  } else {
-    Serial.println("⚠ mDNS 啟動失敗");
-  }
-
-  server.on("/execute", HTTP_POST, handleExecute);
-  server.on("/vision",  HTTP_GET,  handleVision);
-  server.on("/health",  HTTP_GET,  handleHealth);
-  server.onNotFound(handleNotFound);
-  server.begin();
-  MDNS.addService("http", "tcp", cfg::HTTP_PORT);
-  Serial.printf("✅ HTTP server on :%u (/execute, /vision, /health)\n",
-                cfg::HTTP_PORT);
+  Serial.println("\n✅ WiFi 連線成功");
+  Serial.println(WiFi.localIP());
 }
 
 void loop() {
-  feedWDT();
-  if (WiFi.status() != WL_CONNECTED) { WiFi.reconnect(); delay(500); return; }
-  server.handleClient();
+  esp_task_wdt_reset();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    WiFi.reconnect();
+    delay(500);
+    return;
+  }
+
+  if (!busy && millis() - lastVision >= VISION_INTERVAL) {
+    lastVision = millis();
+
+    Block target = getBlockBySig(1);
+    Block dest   = getBlockBySig(2);
+
+    if (target.x != -1 && dest.x != -1) {
+      Serial.printf("👁️ 目標:(%d,%d) 目的地:(%d,%d)\n",
+                    target.x, target.y, dest.x, dest.y);
+      busy = true;
+      sendAndExecute(target.x, target.y, dest.x, dest.y);
+      busy = false;
+      lastVision = millis();
+    } else {
+      if (target.x == -1) Serial.println("👁️ 找不到目標物");
+      if (dest.x   == -1) Serial.println("👁️ 找不到放置目的地");
+    }
+  }
 }
