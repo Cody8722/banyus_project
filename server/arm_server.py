@@ -172,22 +172,48 @@ def build_phase(ik: dict, ch3: int, ch0_offset: int = 0) -> dict:
     }
 
 
+# ── AUTO 模式：開啟後 /report 自動回算並推 /sequence 給 ESP32 ─
+_state_lock = threading.Lock()
+AUTO_MODE   = False
+
+
+def get_auto() -> bool:
+    with _state_lock:
+        return AUTO_MODE
+
+
+def set_auto(value: bool) -> bool:
+    global AUTO_MODE
+    with _state_lock:
+        AUTO_MODE = bool(value)
+        return AUTO_MODE
+
+
 # ── 與 ESP32 溝通（共用 Session） ─────────────────
 _session = requests.Session()
 
 
 def send_to_esp32(payload: dict) -> bool:
+    return _post_esp32("/execute", payload)
+
+
+def push_sequence(angles: dict, target_u: int) -> bool:
+    body = {**angles, "target_u": int(target_u)}
+    return _post_esp32("/sequence", body)
+
+
+def _post_esp32(path: str, payload: dict) -> bool:
     try:
-        resp = _session.post(f"{ESP32_URL}/execute", json=payload, timeout=ESP32_TIMEOUT)
+        resp = _session.post(f"{ESP32_URL}{path}", json=payload, timeout=ESP32_TIMEOUT)
         if resp.status_code == 200:
-            log.info("✅ ESP32 已接受（背景執行中）")
+            log.info("✅ ESP32 %s 已接受", path)
             return True
         if resp.status_code == 503:
-            log.warning("⚠ ESP32 忙碌中，請稍候")
+            log.warning("⚠ ESP32 %s 忙碌中", path)
         else:
-            log.error("❌ ESP32 失敗 code=%d body=%s", resp.status_code, resp.text)
+            log.error("❌ ESP32 %s code=%d body=%s", path, resp.status_code, resp.text)
     except requests.RequestException as e:
-        log.error("❌ ESP32 連線錯誤: %s", e)
+        log.error("❌ ESP32 %s 連線錯誤: %s", path, e)
     return False
 
 
@@ -229,6 +255,48 @@ def arm_control():
     }
     log.info("📤 回傳角度:\n%s", json.dumps(angles, indent=2))
     return jsonify(angles)
+
+
+@app.route("/report", methods=["POST"])
+def report():
+    """ESP32 持續回報的座標封包入口。
+
+    Body: {"tx":int, "ty":int, "dx":int, "dy":int}
+    AUTO 模式關閉時：只記錄。
+    AUTO 模式開啟時：算 IK，反向 POST /sequence 給 ESP32 觸發執行。
+    """
+    data = request.get_json(silent=True) or {}
+    try:
+        tx_px = float(data["tx"]); ty_px = float(data["ty"])
+        dx_px = float(data["dx"]); dy_px = float(data["dy"])
+    except (KeyError, TypeError, ValueError):
+        return jsonify({"error": "missing or invalid tx/ty/dx/dy"}), 400
+
+    auto = get_auto()
+    log.info("📨 /report target=(%.0f,%.0f) dest=(%.0f,%.0f) auto=%s",
+             tx_px, ty_px, dx_px, dy_px, "ON" if auto else "OFF")
+
+    if not auto:
+        return jsonify({"received": True, "auto": False}), 200
+
+    tx, ty = pixel_to_real(tx_px, ty_px)
+    dx, dy = pixel_to_real(dx_px, dy_px)
+    target = xyz_to_angles(tx, ty, OBJECT_Z_MM)
+    dest   = xyz_to_angles(dx, dy, OBJECT_Z_MM)
+    if target is None or dest is None:
+        log.warning("⚠ /report 超出可達範圍")
+        return jsonify({"error": "out of range", "auto": True}), 400
+
+    angles = {
+        "pick":    build_phase(target, CH3_OPEN),
+        "grip":    build_phase(target, CH3_CLOSED),
+        "place":   build_phase(dest,   CH3_CLOSED, ch0_offset=PLACE_CH0_OFFSET),
+        "release": build_phase(dest,   CH3_OPEN,   ch0_offset=PLACE_CH0_OFFSET),
+        "home":    HOME_ANGLES,
+    }
+    log.info("📤 /sequence ← %s", json.dumps(angles))
+    pushed = push_sequence(angles, int(tx_px))
+    return jsonify({"received": True, "auto": True, "pushed": pushed}), 200
 
 
 @app.route("/coord", methods=["POST"])
@@ -296,6 +364,8 @@ class Terminal:
         "\n🚀 手臂控制工具\n"
         "ESP32: {url}\n"
         "指令:\n"
+        "  auto [on|off]  → 切換自動模式（/report 自動回算 /sequence）\n"
+        "  status         → 顯示目前 AUTO 狀態\n"
         "  x,y,z          → 真實座標(mm)\n"
         "  px=u,v         → 像素座標換算\n"
         "  ch0/1/2/3=角度 → 直接控制\n"
@@ -328,6 +398,11 @@ class Terminal:
 
     # 命令分派
     def _dispatch(self, cmd: str) -> bool:
+        if cmd == "status":
+            return self._cmd_status()
+        if cmd == "auto" or cmd.startswith("auto "):
+            arg = cmd[5:].strip() if " " in cmd else ""
+            return self._cmd_auto(arg)
         if cmd == "home":
             return self._cmd_home()
         if cmd.startswith("px="):
@@ -341,6 +416,23 @@ class Terminal:
         if cmd.count(",") == 2:
             return self._cmd_xyz(cmd)
         return False
+
+    # AUTO 模式控制
+    def _cmd_auto(self, arg: str) -> bool:
+        if arg in ("on", "1", "true"):
+            new = set_auto(True)
+        elif arg in ("off", "0", "false"):
+            new = set_auto(False)
+        else:
+            new = set_auto(not get_auto())   # toggle
+        print(f"🔁 AUTO = {'ON' if new else 'OFF'}")
+        return True
+
+    def _cmd_status(self) -> bool:
+        print(f"AUTO = {'ON' if get_auto() else 'OFF'}")
+        print(f"ESP32 = {ESP32_URL}")
+        print(f"目前姿勢 = {self.pose}")
+        return True
 
     def _send_pick(self) -> None:
         send_to_esp32({"pick": dict(self.pose)})

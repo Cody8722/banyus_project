@@ -15,7 +15,8 @@ namespace cfg {
   // WiFi / Server
   constexpr char SSID[]       = "1234567";
   constexpr char PASS[]       = "asdfghjk";
-  constexpr char SERVER_URL[] = "http://10.20.171.77:5000/arm";
+  constexpr char SERVER_BASE[]   = "http://10.20.171.77:5000";  // Flask base URL
+  constexpr char REPORT_PATH[]   = "/report";                    // ESP → Flask 回報座標
   constexpr char MDNS_HOSTNAME[] = "banyus";        // → banyus.local
   constexpr uint16_t HTTP_TIMEOUT_MS = 5000;
   constexpr uint8_t  HTTP_MAX_RETRY  = 2;
@@ -259,44 +260,35 @@ static bool parsePhases(JsonDocument& doc) {
   return true;
 }
 
-// ── HTTP（串流解析 JSON，省 RAM） ──────────────────
-static bool fetchAngles(int tx, int ty, int dx, int dy,
-                        DynamicJsonDocument& doc) {
+// ── HTTP：純回報座標到 Flask /report（fire-and-forget） ─────
+// 角度由 Flask 在 AUTO 模式下主動 POST 回 /sequence
+static bool reportCoords(int tx, int ty, int dx, int dy) {
   char body[96];
   const int n = snprintf(body, sizeof(body),
                          "{\"tx\":%d,\"ty\":%d,\"dx\":%d,\"dy\":%d}",
                          tx, ty, dx, dy);
   if (n <= 0 || n >= (int)sizeof(body)) return false;
-  Serial.printf("📤 POST: %s\n", body);
+
+  const String url = String(cfg::SERVER_BASE) + cfg::REPORT_PATH;
+  Serial.printf("📤 %s %s\n", url.c_str(), body);
 
   HTTPClient http;
   http.setTimeout(cfg::HTTP_TIMEOUT_MS);
   http.setReuse(false);
 
-  int code = -1;
   uint16_t backoff = 300;
   for (uint8_t attempt = 0; attempt <= cfg::HTTP_MAX_RETRY; attempt++) {
-    if (!http.begin(cfg::SERVER_URL)) { delay(200); continue; }
+    if (!http.begin(url)) { delay(200); continue; }
     http.addHeader("Content-Type", "application/json");
-    code = http.POST((uint8_t*)body, n);
-    if (code == 200) {
-      const DeserializationError err = deserializeJson(doc, http.getStream());
-      http.end();
-      if (err) {
-        Serial.printf("❌ JSON 解析失敗: %s\n", err.c_str());
-        return false;
-      }
-      Serial.println("✅ 收到角度");
-      return true;
-    }
-    Serial.printf("⚠ HTTP code=%d (重試 %u/%u, %ums)\n",
-                  code, attempt + 1, cfg::HTTP_MAX_RETRY, backoff);
+    const int code = http.POST((uint8_t*)body, n);
     http.end();
+    if (code == 200) return true;
+    Serial.printf("⚠ /report code=%d (重試 %u/%u, %ums)\n",
+                  code, attempt + 1, cfg::HTTP_MAX_RETRY, backoff);
     feedWDT();
     delay(backoff);
     backoff = min<uint16_t>(backoff * 2, 2000);
   }
-  Serial.printf("❌ HTTP 失敗 code=%d\n", code);
   return false;
 }
 
@@ -394,13 +386,8 @@ static void tickIdle() {
   Serial.printf("👁 目標:(%d,%d) 目的地:(%d,%d)\n",
                 target.x, target.y, dest.x, dest.y);
 
-  DynamicJsonDocument doc(cfg::JSON_BUF_SIZE);
-  if (!fetchAngles(target.x, target.y, dest.x, dest.y, doc)) return;
-  if (!parsePhases(doc)) return;
-
-  S.target_u = target.x;
-  S.stage    = Stage::EXECUTE;
-  enterPhase(0);
+  // 純回報；Flask 在 AUTO 模式時會主動 POST /sequence 回來觸發執行
+  reportCoords(target.x, target.y, dest.x, dest.y);
 }
 
 // ── HTTP server handlers ─────────────────────────
@@ -454,6 +441,36 @@ static void handleExecute() {
     return;
   }
   sendJson(400, "{\"error\":\"no phase in body\"}");
+}
+
+// 接收完整 5 階段 JSON（同 /arm 回應格式 + target_u）→ 啟動視覺序列 FSM
+static void handleSequence() {
+  if (S.stage != Stage::IDLE || motion.active) {
+    sendJson(503, "{\"error\":\"busy\"}");
+    return;
+  }
+  if (!server.hasArg("plain")) {
+    sendJson(400, "{\"error\":\"no body\"}");
+    return;
+  }
+
+  DynamicJsonDocument doc(cfg::JSON_BUF_SIZE);
+  const DeserializationError err = deserializeJson(doc, server.arg("plain"));
+  if (err) {
+    Serial.printf("⚠ /sequence JSON 解析失敗: %s\n", err.c_str());
+    sendJson(400, "{\"error\":\"bad json\"}");
+    return;
+  }
+
+  if (!parsePhases(doc)) {
+    sendJson(400, "{\"error\":\"no phases\"}");
+    return;
+  }
+  S.target_u = doc["target_u"] | -1;     // 沒帶就跳過 PID
+  S.stage    = Stage::EXECUTE;
+  Serial.printf("📥 /sequence 啟動，target_u=%d\n", S.target_u);
+  enterPhase(0);
+  sendJson(200, "{\"ok\":true}");
 }
 
 static void handleNotFound() {
@@ -517,12 +534,13 @@ void setup() {
 
   if (!wifiConnect()) ESP.restart();
 
-  server.on("/execute", HTTP_POST, handleExecute);
-  server.on("/health",  HTTP_GET,  handleHealth);
+  server.on("/execute",  HTTP_POST, handleExecute);
+  server.on("/sequence", HTTP_POST, handleSequence);
+  server.on("/health",   HTTP_GET,  handleHealth);
   server.onNotFound(handleNotFound);
   server.begin();
   MDNS.addService("http", "tcp", cfg::HTTP_LISTEN_PORT);
-  Serial.printf("✅ HTTP server on :%u (/execute, /health)\n",
+  Serial.printf("✅ HTTP server on :%u (/execute, /sequence, /health)\n",
                 cfg::HTTP_LISTEN_PORT);
 }
 
