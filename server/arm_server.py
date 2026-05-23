@@ -1,7 +1,13 @@
-"""Banyus arm — Flask backend.
+"""Banyus arm — Flask backend (polling architecture).
 
-接收 ESP32 送來的像素座標，做 IK 計算後回傳 5 階段伺服角度。
-也提供 /execute 與 /health，以及終端互動工具。
+ESP32 是純 HTTP server，暴露:
+  - GET  /vision   → Pixy 中位數座標 {target_found, dest_found, tx, ty, dx, dy}
+  - POST /execute  → 收 5 階段 JSON（可含 target_u 觸發 PID）執行動作
+
+本伺服器:
+  - 定期 GET /vision（AUTO 模式開啟時）
+  - 偵測到 target+dest → 算 IK → POST /execute
+  - 終端可手動 scan / 推單一姿勢
 
 IK 公式（cal_arm_angle / angles_to_servo / 內插表）原樣保留。
 """
@@ -18,22 +24,24 @@ import numpy as np
 import requests
 from flask import Flask, jsonify, request
 
-# ── 設定常數 ─────────────────────────────────────
+# ── 設定 ─────────────────────────────────────────
 HOST = "0.0.0.0"
 PORT = 5000
-ESP32_URL     = "http://banyus.local"   # ESP32 端註冊的 mDNS 名稱，免擔心 DHCP 變動
-ESP32_TIMEOUT = 30   # s
+ESP32_URL     = "http://banyus.local"   # mDNS 名稱，DHCP 變動也免改
+ESP32_TIMEOUT = 30                       # /execute 包含整段動作時間
+
+POLL_INTERVAL_S = 3.0                    # AUTO 模式輪詢間隔
+VISION_TIMEOUT  = 5                      # GET /vision 逾時
 
 OBJECT_Z_MM      = 10
-PLACE_CH0_OFFSET = -5   # 放置時的 ch0 機構偏移補償
+PLACE_CH0_OFFSET = -5
 
-HOME_ANGLES   = {"ch0": 90, "ch1": 90,  "ch2": 120, "ch3": 5}
-INITIAL_POSE  = {"ch0": 90, "ch1": 153, "ch2": 25,  "ch3": 5}
+HOME_ANGLES  = {"ch0": 90, "ch1": 90,  "ch2": 120, "ch3": 5}
+INITIAL_POSE = {"ch0": 90, "ch1": 153, "ch2": 25,  "ch3": 5}
 
 CH3_OPEN   = 5
 CH3_CLOSED = 90
 
-# 各軸允許範圍（與 ESP32 端一致）
 SERVO_LIMITS = {
     "ch0": (5, 175),
     "ch1": (90, 175),
@@ -42,8 +50,8 @@ SERVO_LIMITS = {
 }
 
 # 由實機校正得到的機構補償（不影響 IK 數學）
-CH0_OFFSET_NEG = -4   # clamta < 0 時
-CH0_OFFSET_POS = -5   # clamta > 0 時
+CH0_OFFSET_NEG = -4   # clamta < 0
+CH0_OFFSET_POS = -5   # clamta > 0
 CH1_OFFSET     = -3
 
 # ── Logger ───────────────────────────────────────
@@ -55,7 +63,7 @@ logging.basicConfig(
 log = logging.getLogger("arm")
 logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
-# ── Homography（像素 → 真實 mm） ───────────────────
+# ── Homography ───────────────────────────────────
 PIXEL_PTS = np.array([
     [142, 151],
     [92,  138],
@@ -79,20 +87,15 @@ def pixel_to_real(u: float, v: float) -> tuple[float, float]:
     return float(real[0][0][0]), float(real[0][0][1])
 
 
-# ── IK 參數（保留原值） ──────────────────────────
-A1 = 81.4
-A2 = 84.0
-A3 = 67.0
+# ── IK 參數（保留） ──────────────────────────────
+A1, A2, A3 = 81.4, 84.0, 67.0
 
-# cL (deg) → ch1 線性內插
 CL_TABLE  = [13.6, 36.1, 49.2, 60.4, 71.1]
 CH1_TABLE = [175,  160,  153,  140,  135]
 
-# cR (deg) → ch2 線性內插
 CR_TABLE  = [2.9,  23.1, 33.7, 41.6, 47.6]
 CH2_TABLE = [60,   40,   25,   10,   0]
 
-# 可達範圍（rad），與原本完全相同
 LIMITS_RAD = {
     "clamta": (math.radians(-97),  math.radians(137)),
     "cL":     (math.radians(-15),  math.radians(128)),
@@ -172,8 +175,60 @@ def build_phase(ik: dict, ch3: int, ch0_offset: int = 0) -> dict:
     }
 
 
-# ── AUTO 模式：開啟後 /report 自動回算並推 /sequence 給 ESP32 ─
+def compute_sequence(tx_px: float, ty_px: float,
+                     dx_px: float, dy_px: float) -> Optional[dict]:
+    """像素座標 → 5 階段角度 + target_u（給 PID 用）"""
+    tx, ty = pixel_to_real(tx_px, ty_px)
+    dx, dy = pixel_to_real(dx_px, dy_px)
+    target = xyz_to_angles(tx, ty, OBJECT_Z_MM)
+    dest   = xyz_to_angles(dx, dy, OBJECT_Z_MM)
+    if target is None or dest is None:
+        return None
+    return {
+        "pick":     build_phase(target, CH3_OPEN),
+        "grip":     build_phase(target, CH3_CLOSED),
+        "place":    build_phase(dest,   CH3_CLOSED, ch0_offset=PLACE_CH0_OFFSET),
+        "release":  build_phase(dest,   CH3_OPEN,   ch0_offset=PLACE_CH0_OFFSET),
+        "home":     HOME_ANGLES,
+        "target_u": int(tx_px),
+    }
+
+
+# ── 與 ESP32 溝通（共用 Session） ─────────────────
+_session = requests.Session()
+
+
+def get_vision() -> Optional[dict]:
+    try:
+        r = _session.get(f"{ESP32_URL}/vision", timeout=VISION_TIMEOUT)
+        if r.status_code == 200:
+            return r.json()
+        if r.status_code == 503:
+            return None  # busy，下次再試
+        log.error("❌ /vision code=%d", r.status_code)
+    except requests.RequestException as e:
+        log.error("❌ /vision 失敗: %s", e)
+    return None
+
+
+def post_execute(payload: dict) -> bool:
+    try:
+        r = _session.post(f"{ESP32_URL}/execute", json=payload, timeout=ESP32_TIMEOUT)
+        if r.status_code == 200:
+            log.info("✅ /execute 已接受")
+            return True
+        if r.status_code == 503:
+            log.warning("⚠ ESP32 忙碌中")
+        else:
+            log.error("❌ /execute code=%d body=%s", r.status_code, r.text)
+    except requests.RequestException as e:
+        log.error("❌ /execute 失敗: %s", e)
+    return False
+
+
+# ── AUTO 模式（輪詢 /vision） ─────────────────────
 _state_lock = threading.Lock()
+_stop_event = threading.Event()
 AUTO_MODE   = False
 
 
@@ -189,82 +244,46 @@ def set_auto(value: bool) -> bool:
         return AUTO_MODE
 
 
-# ── 與 ESP32 溝通（共用 Session） ─────────────────
-_session = requests.Session()
+def vision_poller() -> None:
+    log.info("👁 視覺輪詢執行緒啟動 (interval=%.1fs)", POLL_INTERVAL_S)
+    while not _stop_event.is_set():
+        if not get_auto():
+            _stop_event.wait(POLL_INTERVAL_S)
+            continue
 
+        vision = get_vision()
+        if vision is None:
+            _stop_event.wait(POLL_INTERVAL_S)
+            continue
 
-def send_to_esp32(payload: dict) -> bool:
-    return _post_esp32("/execute", payload)
+        if not (vision.get("target_found") and vision.get("dest_found")):
+            log.info("👁 找不到目標 (target=%s dest=%s)",
+                     vision.get("target_found"), vision.get("dest_found"))
+            _stop_event.wait(POLL_INTERVAL_S)
+            continue
 
+        tx_px, ty_px = vision["tx"], vision["ty"]
+        dx_px, dy_px = vision["dx"], vision["dy"]
+        log.info("👁 target=(%d,%d) dest=(%d,%d)", tx_px, ty_px, dx_px, dy_px)
 
-def push_sequence(angles: dict, target_u: int) -> bool:
-    body = {**angles, "target_u": int(target_u)}
-    return _post_esp32("/sequence", body)
-
-
-def _post_esp32(path: str, payload: dict) -> bool:
-    try:
-        resp = _session.post(f"{ESP32_URL}{path}", json=payload, timeout=ESP32_TIMEOUT)
-        if resp.status_code == 200:
-            log.info("✅ ESP32 %s 已接受", path)
-            return True
-        if resp.status_code == 503:
-            log.warning("⚠ ESP32 %s 忙碌中", path)
+        seq = compute_sequence(tx_px, ty_px, dx_px, dy_px)
+        if seq is None:
+            log.warning("⚠ 超出可達範圍")
         else:
-            log.error("❌ ESP32 %s code=%d body=%s", path, resp.status_code, resp.text)
-    except requests.RequestException as e:
-        log.error("❌ ESP32 %s 連線錯誤: %s", path, e)
-    return False
+            log.info("📤 /execute ← %s", json.dumps(seq))
+            post_execute(seq)
+
+        # 動作中 ESP /vision 會回 503，自然形成節流
+        _stop_event.wait(POLL_INTERVAL_S)
 
 
-# ── Flask routes ─────────────────────────────────
+# ── Flask routes（保留 /arm 與 /health 供外部測試） ─
 app = Flask(__name__)
 
 
 @app.route("/arm", methods=["POST"])
 def arm_control():
-    data = request.get_json(silent=True) or {}
-    try:
-        tx_px = float(data["tx"])
-        ty_px = float(data["ty"])
-        dx_px = float(data["dx"])
-        dy_px = float(data["dy"])
-    except (KeyError, TypeError, ValueError):
-        return jsonify({"error": "missing or invalid tx/ty/dx/dy"}), 400
-
-    log.info("📍 像素 target=(%.0f,%.0f) dest=(%.0f,%.0f)",
-             tx_px, ty_px, dx_px, dy_px)
-
-    tx, ty = pixel_to_real(tx_px, ty_px)
-    dx, dy = pixel_to_real(dx_px, dy_px)
-    log.info("📐 目標   x=%.1f y=%.1f z=%d", tx, ty, OBJECT_Z_MM)
-    log.info("📐 目的地 x=%.1f y=%.1f z=%d", dx, dy, OBJECT_Z_MM)
-
-    target = xyz_to_angles(tx, ty, OBJECT_Z_MM)
-    dest   = xyz_to_angles(dx, dy, OBJECT_Z_MM)
-    if target is None or dest is None:
-        log.warning("⚠ 超出可達範圍")
-        return jsonify({"error": "out of range"}), 400
-
-    angles = {
-        "pick":    build_phase(target, CH3_OPEN),
-        "grip":    build_phase(target, CH3_CLOSED),
-        "place":   build_phase(dest,   CH3_CLOSED, ch0_offset=PLACE_CH0_OFFSET),
-        "release": build_phase(dest,   CH3_OPEN,   ch0_offset=PLACE_CH0_OFFSET),
-        "home":    HOME_ANGLES,
-    }
-    log.info("📤 回傳角度:\n%s", json.dumps(angles, indent=2))
-    return jsonify(angles)
-
-
-@app.route("/report", methods=["POST"])
-def report():
-    """ESP32 持續回報的座標封包入口。
-
-    Body: {"tx":int, "ty":int, "dx":int, "dy":int}
-    AUTO 模式關閉時：只記錄。
-    AUTO 模式開啟時：算 IK，反向 POST /sequence 給 ESP32 觸發執行。
-    """
+    """外部直接 POST 像素 → 回 5 階段角度，方便 curl 測 IK 管線（不會推 ESP32）。"""
     data = request.get_json(silent=True) or {}
     try:
         tx_px = float(data["tx"]); ty_px = float(data["ty"])
@@ -272,90 +291,17 @@ def report():
     except (KeyError, TypeError, ValueError):
         return jsonify({"error": "missing or invalid tx/ty/dx/dy"}), 400
 
-    auto = get_auto()
-    log.info("📨 /report target=(%.0f,%.0f) dest=(%.0f,%.0f) auto=%s",
-             tx_px, ty_px, dx_px, dy_px, "ON" if auto else "OFF")
-
-    if not auto:
-        return jsonify({"received": True, "auto": False}), 200
-
-    tx, ty = pixel_to_real(tx_px, ty_px)
-    dx, dy = pixel_to_real(dx_px, dy_px)
-    target = xyz_to_angles(tx, ty, OBJECT_Z_MM)
-    dest   = xyz_to_angles(dx, dy, OBJECT_Z_MM)
-    if target is None or dest is None:
-        log.warning("⚠ /report 超出可達範圍")
-        return jsonify({"error": "out of range", "auto": True}), 400
-
-    angles = {
-        "pick":    build_phase(target, CH3_OPEN),
-        "grip":    build_phase(target, CH3_CLOSED),
-        "place":   build_phase(dest,   CH3_CLOSED, ch0_offset=PLACE_CH0_OFFSET),
-        "release": build_phase(dest,   CH3_OPEN,   ch0_offset=PLACE_CH0_OFFSET),
-        "home":    HOME_ANGLES,
-    }
-    log.info("📤 /sequence ← %s", json.dumps(angles))
-    pushed = push_sequence(angles, int(tx_px))
-    return jsonify({"received": True, "auto": True, "pushed": pushed}), 200
-
-
-@app.route("/coord", methods=["POST"])
-def coord():
-    """單點換算：像素 → 真實 → IK 角度。
-
-    Body 範例:
-        {"u": 145, "v": 88}                       # 最小用法
-        {"u": 145, "v": 88, "z": 10, "ch3": 5}    # 指定高度與夾爪
-        {"u": 145, "v": 88, "send": true}         # 算完直接推給 ESP32 pick
-    """
-    data = request.get_json(silent=True) or {}
-    try:
-        u = float(data["u"])
-        v = float(data["v"])
-    except (KeyError, TypeError, ValueError):
-        return jsonify({"error": "missing or invalid u/v"}), 400
-
-    z         = float(data.get("z",   OBJECT_Z_MM))
-    ch3       = clamp("ch3", int(data.get("ch3", CH3_OPEN)))
-    auto_send = bool(data.get("send", False))
-
-    x, y = pixel_to_real(u, v)
-    log.info("📍 /coord 像素=(%.0f,%.0f) → 真實 x=%.1f y=%.1f z=%.1f",
-             u, v, x, y, z)
-
-    ik = xyz_to_angles(x, y, z)
-    if ik is None:
+    log.info("📍 /arm target=(%.0f,%.0f) dest=(%.0f,%.0f)", tx_px, ty_px, dx_px, dy_px)
+    seq = compute_sequence(tx_px, ty_px, dx_px, dy_px)
+    if seq is None:
         log.warning("⚠ 超出可達範圍")
-        return jsonify({
-            "error": "out of range",
-            "pixel": {"u": u, "v": v},
-            "real":  {"x": round(x, 2), "y": round(y, 2), "z": z},
-        }), 400
-
-    angles = {**ik, "ch3": ch3}
-    log.info("📤 角度: %s", angles)
-
-    result = {
-        "pixel":  {"u": u, "v": v},
-        "real":   {"x": round(x, 2), "y": round(y, 2), "z": z},
-        "angles": angles,
-    }
-    if auto_send:
-        result["sent"] = send_to_esp32({"pick": angles})
-
-    return jsonify(result)
-
-
-@app.route("/execute", methods=["POST"])
-def execute():
-    data = request.get_json(silent=True) or {}
-    log.info("📥 直接角度:\n%s", json.dumps(data, indent=2))
-    return jsonify(data)
+        return jsonify({"error": "out of range"}), 400
+    return jsonify(seq)
 
 
 @app.route("/health", methods=["GET"])
 def health():
-    return "OK", 200
+    return jsonify({"status": "ok", "auto": get_auto()})
 
 
 # ── 終端互動 ─────────────────────────────────────
@@ -364,21 +310,20 @@ class Terminal:
         "\n🚀 手臂控制工具\n"
         "ESP32: {url}\n"
         "指令:\n"
-        "  auto [on|off]  → 切換自動模式（/report 自動回算 /sequence）\n"
-        "  status         → 顯示目前 AUTO 狀態\n"
+        "  auto [on|off]  → 切換自動輪詢（/vision → IK → /execute）\n"
+        "  scan           → 手動掃一次 /vision，找到就執行\n"
+        "  status         → 顯示 AUTO 狀態與目前姿勢\n"
         "  x,y,z          → 真實座標(mm)\n"
         "  px=u,v         → 像素座標換算\n"
         "  ch0/1/2/3=角度 → 直接控制\n"
         "  all=ch0,ch1,ch2,ch3\n"
         "  home / q\n"
     )
-
     SINGLE_CH = ("ch0", "ch1", "ch2", "ch3")
 
     def __init__(self) -> None:
         self.pose: dict = dict(INITIAL_POSE)
 
-    # 主迴圈
     def run(self) -> None:
         print(self.HELP.format(url=ESP32_URL))
         while True:
@@ -393,13 +338,15 @@ class Terminal:
                 continue
             if not self._dispatch(cmd):
                 print("不認識的指令")
-        send_to_esp32({"home": HOME_ANGLES})
+        _stop_event.set()
+        post_execute({"home": HOME_ANGLES})
         print("✅ 結束")
 
-    # 命令分派
     def _dispatch(self, cmd: str) -> bool:
         if cmd == "status":
             return self._cmd_status()
+        if cmd == "scan":
+            return self._cmd_scan()
         if cmd == "auto" or cmd.startswith("auto "):
             arg = cmd[5:].strip() if " " in cmd else ""
             return self._cmd_auto(arg)
@@ -417,29 +364,47 @@ class Terminal:
             return self._cmd_xyz(cmd)
         return False
 
-    # AUTO 模式控制
+    # AUTO / status / scan
     def _cmd_auto(self, arg: str) -> bool:
         if arg in ("on", "1", "true"):
             new = set_auto(True)
         elif arg in ("off", "0", "false"):
             new = set_auto(False)
         else:
-            new = set_auto(not get_auto())   # toggle
+            new = set_auto(not get_auto())
         print(f"🔁 AUTO = {'ON' if new else 'OFF'}")
         return True
 
     def _cmd_status(self) -> bool:
-        print(f"AUTO = {'ON' if get_auto() else 'OFF'}")
+        print(f"AUTO  = {'ON' if get_auto() else 'OFF'}")
         print(f"ESP32 = {ESP32_URL}")
         print(f"目前姿勢 = {self.pose}")
         return True
 
-    def _send_pick(self) -> None:
-        send_to_esp32({"pick": dict(self.pose)})
+    def _cmd_scan(self) -> bool:
+        vision = get_vision()
+        if vision is None:
+            print("❌ 取不到 /vision")
+            return True
+        print(f"👁 {vision}")
+        if not (vision.get("target_found") and vision.get("dest_found")):
+            print("⚠ 沒同時找到 target+dest")
+            return True
+        seq = compute_sequence(vision["tx"], vision["ty"],
+                               vision["dx"], vision["dy"])
+        if seq is None:
+            print("⚠ 超出可達範圍")
+            return True
+        print(f"📤 {json.dumps(seq)}")
+        post_execute(seq)
+        return True
 
-    # 各指令處理
+    # 手動推姿勢
+    def _send_pick(self) -> None:
+        post_execute({"pick": dict(self.pose)})
+
     def _cmd_home(self) -> bool:
-        send_to_esp32({"home": HOME_ANGLES})
+        post_execute({"home": HOME_ANGLES})
         self.pose = dict(INITIAL_POSE)
         return True
 
@@ -496,7 +461,7 @@ class Terminal:
             print("❌ 格式錯誤")
             return True
         self.pose = pose
-        send_to_esp32({"pick": pose})
+        post_execute({"pick": pose})
         print(f"全軸設定: {pose}")
         return True
 
@@ -508,8 +473,8 @@ def _start_flask() -> None:
 
 def main() -> None:
     log.info("🚀 Flask server 啟動在 %s:%d", HOST, PORT)
-    t = threading.Thread(target=_start_flask, daemon=True)
-    t.start()
+    threading.Thread(target=_start_flask, daemon=True).start()
+    threading.Thread(target=vision_poller, daemon=True).start()
     Terminal().run()
 
 
