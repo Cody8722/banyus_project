@@ -231,6 +231,53 @@ def arm_control():
     return jsonify(angles)
 
 
+@app.route("/coord", methods=["POST"])
+def coord():
+    """單點換算：像素 → 真實 → IK 角度。
+
+    Body 範例:
+        {"u": 145, "v": 88}                       # 最小用法
+        {"u": 145, "v": 88, "z": 10, "ch3": 5}    # 指定高度與夾爪
+        {"u": 145, "v": 88, "send": true}         # 算完直接推給 ESP32 pick
+    """
+    data = request.get_json(silent=True) or {}
+    try:
+        u = float(data["u"])
+        v = float(data["v"])
+    except (KeyError, TypeError, ValueError):
+        return jsonify({"error": "missing or invalid u/v"}), 400
+
+    z         = float(data.get("z",   OBJECT_Z_MM))
+    ch3       = clamp("ch3", int(data.get("ch3", CH3_OPEN)))
+    auto_send = bool(data.get("send", False))
+
+    x, y = pixel_to_real(u, v)
+    log.info("📍 /coord 像素=(%.0f,%.0f) → 真實 x=%.1f y=%.1f z=%.1f",
+             u, v, x, y, z)
+
+    ik = xyz_to_angles(x, y, z)
+    if ik is None:
+        log.warning("⚠ 超出可達範圍")
+        return jsonify({
+            "error": "out of range",
+            "pixel": {"u": u, "v": v},
+            "real":  {"x": round(x, 2), "y": round(y, 2), "z": z},
+        }), 400
+
+    angles = {**ik, "ch3": ch3}
+    log.info("📤 角度: %s", angles)
+
+    result = {
+        "pixel":  {"u": u, "v": v},
+        "real":   {"x": round(x, 2), "y": round(y, 2), "z": z},
+        "angles": angles,
+    }
+    if auto_send:
+        result["sent"] = send_to_esp32({"pick": angles})
+
+    return jsonify(result)
+
+
 @app.route("/execute", methods=["POST"])
 def execute():
     data = request.get_json(silent=True) or {}
