@@ -3,6 +3,7 @@
 
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <WebServer.h>
 #include <ESPmDNS.h>
 #include <Adafruit_PWMServoDriver.h>
 #include <Wire.h>
@@ -18,6 +19,7 @@ namespace cfg {
   constexpr char MDNS_HOSTNAME[] = "banyus";        // → banyus.local
   constexpr uint16_t HTTP_TIMEOUT_MS = 5000;
   constexpr uint8_t  HTTP_MAX_RETRY  = 2;
+  constexpr uint16_t HTTP_LISTEN_PORT = 80;          // ESP32 端 /execute /health
 
   // I2C
   constexpr uint8_t  PWM_ADDR   = 0x40;
@@ -114,6 +116,7 @@ struct SysState {
 
 // ── 全域 ──────────────────────────────────────────
 static Adafruit_PWMServoDriver pwm(cfg::PWM_ADDR);
+static WebServer    server(cfg::HTTP_LISTEN_PORT);
 static int          cur[4] = {cfg::HOME_CH0, cfg::HOME_CH1, cfg::HOME_CH2, cfg::HOME_CH3};
 static Motion       motion;
 static const char* const PHASE_NAMES[] = {"pick", "grip", "place", "release", "home"};
@@ -400,6 +403,63 @@ static void tickIdle() {
   enterPhase(0);
 }
 
+// ── HTTP server handlers ─────────────────────────
+// 接受 {"home":{ch0,ch1,ch2,ch3}} / {"pick":{...}} 等單一階段格式。
+// 忙碌時回 503；接受後立刻回 200，動作於 tickMotion 背景執行。
+static void sendJson(int code, const char* body) {
+  server.send(code, "application/json", body);
+}
+
+static void handleHealth() {
+  char buf[80];
+  snprintf(buf, sizeof(buf),
+           "{\"motion\":%s,\"stage\":%d,\"ch\":[%d,%d,%d,%d]}",
+           motion.active ? "true" : "false",
+           (int)S.stage,
+           cur[0], cur[1], cur[2], cur[3]);
+  sendJson(200, buf);
+}
+
+static void handleExecute() {
+  if (S.stage != Stage::IDLE || motion.active) {
+    sendJson(503, "{\"error\":\"busy\"}");
+    return;
+  }
+  if (!server.hasArg("plain")) {
+    sendJson(400, "{\"error\":\"no body\"}");
+    return;
+  }
+
+  DynamicJsonDocument doc(512);
+  const DeserializationError err = deserializeJson(doc, server.arg("plain"));
+  if (err) {
+    Serial.printf("⚠ /execute JSON 解析失敗: %s\n", err.c_str());
+    sendJson(400, "{\"error\":\"bad json\"}");
+    return;
+  }
+
+  // 取第一個是 object 的鍵
+  JsonObject root = doc.as<JsonObject>();
+  for (JsonPair p : root) {
+    if (!p.value().is<JsonObject>()) continue;
+    JsonObject a = p.value().as<JsonObject>();
+    const int ch0 = constrain((int)a["ch0"], cfg::SERVO_LO, cfg::SERVO_HI);
+    const int ch1 = constrain((int)a["ch1"], cfg::SERVO_LO, cfg::SERVO_HI);
+    const int ch2 = constrain((int)a["ch2"], cfg::SERVO_LO, cfg::SERVO_HI);
+    const int ch3 = constrain((int)a["ch3"], cfg::SERVO_LO, cfg::GRIPPER_HI);
+    Serial.printf("📥 /execute %s → ch0=%d ch1=%d ch2=%d ch3=%d\n",
+                  p.key().c_str(), ch0, ch1, ch2, ch3);
+    startMotion(ch0, ch1, ch2, ch3, cfg::MOVE_MS);
+    sendJson(200, "{\"ok\":true}");
+    return;
+  }
+  sendJson(400, "{\"error\":\"no phase in body\"}");
+}
+
+static void handleNotFound() {
+  sendJson(404, "{\"error\":\"not found\"}");
+}
+
 // ── WiFi / Watchdog ──────────────────────────────
 static bool wifiConnect() {
   WiFi.mode(WIFI_STA);
@@ -456,13 +516,22 @@ void setup() {
   Serial.println("✅ Pixy2 I2C 初始化完成");
 
   if (!wifiConnect()) ESP.restart();
+
+  server.on("/execute", HTTP_POST, handleExecute);
+  server.on("/health",  HTTP_GET,  handleHealth);
+  server.onNotFound(handleNotFound);
+  server.begin();
+  MDNS.addService("http", "tcp", cfg::HTTP_LISTEN_PORT);
+  Serial.printf("✅ HTTP server on :%u (/execute, /health)\n",
+                cfg::HTTP_LISTEN_PORT);
 }
 
 void loop() {
   feedWDT();
   if (WiFi.status() != WL_CONNECTED) { WiFi.reconnect(); delay(500); return; }
 
-  tickMotion();    // 每 tick 更新一次 PWM（若有 active motion）
-  tickExecute();   // 推進階段/PID FSM
-  tickIdle();      // 沒事就掃 vision，有目標就啟動
+  server.handleClient();  // 處理 /execute /health
+  tickMotion();           // 每 tick 更新一次 PWM（若有 active motion）
+  tickExecute();          // 推進階段/PID FSM
+  tickIdle();             // 沒事就掃 vision，有目標就啟動
 }

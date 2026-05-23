@@ -180,9 +180,12 @@ def send_to_esp32(payload: dict) -> bool:
     try:
         resp = _session.post(f"{ESP32_URL}/execute", json=payload, timeout=ESP32_TIMEOUT)
         if resp.status_code == 200:
-            log.info("✅ ESP32 執行完成")
+            log.info("✅ ESP32 已接受（背景執行中）")
             return True
-        log.error("❌ ESP32 失敗 code=%d", resp.status_code)
+        if resp.status_code == 503:
+            log.warning("⚠ ESP32 忙碌中，請稍候")
+        else:
+            log.error("❌ ESP32 失敗 code=%d body=%s", resp.status_code, resp.text)
     except requests.RequestException as e:
         log.error("❌ ESP32 連線錯誤: %s", e)
     return False
